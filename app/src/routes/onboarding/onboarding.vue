@@ -3,7 +3,8 @@ import api from '@/api';
 import { useServerStore } from '@/stores/server';
 import { useSettingsStore } from '@/stores/settings';
 import { useUserStore } from '@/stores/user';
-import { Field, OnboardingPayload, SettingsOnboarding, UserOnboarding } from '@directus/types';
+import { collectOnboarding } from '@/utils/send-onboarding';
+import { Field, SettingsOnboarding, UserOnboarding } from '@directus/types';
 import { Ref, computed, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { useRouter } from 'vue-router';
@@ -97,6 +98,7 @@ const isLoading = ref(false);
 const activeSlideNames = computed(() => Object.keys(slides.value).filter((key) => slides.value[key]));
 const currentSlideIndex = computed(() => activeSlideNames.value.findIndex((key) => key === currentSlideName.value));
 const currentSlide = computed(() => slides.value[currentSlideName.value]);
+const isFirstSlide = computed(() => currentSlide.value?.transitions.back === null);
 const isLastSlide = computed(() => currentSlide.value?.transitions.next === 'finish');
 
 // Add one so that there is progress on the first slide
@@ -110,7 +112,7 @@ async function finishOnboarding() {
 			project_logo: projectModel.value.project_logo,
 			project_color: projectModel.value.project_color,
 			onboarding: JSON.stringify({
-				project_use_case: projectModel.value.project_use_case,
+				project_use_case: projectModel.value.project_use_case ?? null,
 			} satisfies SettingsOnboarding),
 		})
 		.then(() => serverStore.hydrate())
@@ -122,7 +124,7 @@ async function finishOnboarding() {
 			last_name: userModel.value.last_name,
 			email: userModel.value.email, // TODO validate before!
 			onboarding: JSON.stringify({
-				primary_skillset: userModel.value.primary_skillset,
+				primary_skillset: userModel.value.primary_skillset ?? null,
 				wants_emails: userModel.value.wants_emails,
 				retryTransmission: true,
 			} satisfies UserOnboarding),
@@ -130,25 +132,13 @@ async function finishOnboarding() {
 		.then(() => userStore.hydrate())
 		.catch((e) => console.error('Error when updating user', e));
 
-	const payload: OnboardingPayload = {
-		version: 1,
-		body: {
-			user: {
-				email: userModel.value.email,
-				wants_emails: userModel.value.wants_emails,
-				primary_skillset: userModel.value.primary_skillset,
-			},
-			project: {
-				name: projectModel.value.project_name,
-				url: projectModel.value.project_url ?? undefined,
-				type: projectModel.value.project_use_case,
-			},
-		},
-	};
-	// TODO: Send payload to endpoint
-
 	await Promise.allSettled([settingUpdate, userUpdate]);
-	return router.replace('/content');
+
+	// Dont await the result, similar to telemetry
+	// It might fail but proceed as normal for seamless user experience
+	collectOnboarding().catch(() => {});
+
+	// return router.replace('/content');
 }
 
 function prevSlide() {
@@ -162,14 +152,28 @@ function prevSlide() {
 async function skipOnboarding() {
 	isLoading.value = true;
 
+	const settingUpdate = settingsStore
+		.updateSettings({
+			onboarding: JSON.stringify({
+				project_use_case: null,
+			} satisfies SettingsOnboarding),
+		})
+		.then(() => serverStore.hydrate())
+		.catch((e) => console.error('Error when updating settings', e));
+
 	const userUpdate = api
 		.patch(`/users/${userModel.value.id}`, {
-			onboarding: '{}',
+			onboarding: JSON.stringify({
+				primary_skillset: null,
+				wants_emails: false,
+				retryTransmission: false,
+			} satisfies UserOnboarding),
 		})
 		.then(() => userStore.hydrate())
 		.catch((e) => console.error('Error when updating user', e));
 
-	await Promise.allSettled([userUpdate]);
+	await Promise.allSettled([settingUpdate, userUpdate]);
+
 	router.replace('/content').finally(() => (isLoading.value = false));
 }
 
@@ -194,6 +198,22 @@ async function nextSlide() {
 
 <template>
 	<public-view :wide="true">
+		<template #actions>
+			<Transition name="dialog">
+				<v-button
+					v-if="!isLoading"
+					secondary
+					x-small
+					kind="link"
+					:disabled="isLoading"
+					class="btn-skip"
+					@click="skipOnboarding"
+				>
+					{{ t('onboarding.action.skip') }}
+				</v-button>
+			</Transition>
+		</template>
+
 		<div class="container">
 			<!-- Top Navbar -->
 			<div class="nav">
@@ -236,15 +256,16 @@ async function nextSlide() {
 				<!-- Right Actions -->
 				<div>
 					<v-button v-if="!isLoading" :disabled="isLoading" @click="nextSlide">
-						{{ isLastSlide ? t('finish_setup') : t('next') }}
+						{{
+							isFirstSlide
+								? t('onboarding.action.first')
+								: isLastSlide
+								? t('onboarding.action.last')
+								: t('onboarding.action.continue')
+						}}
 					</v-button>
 				</div>
 			</div>
-			<Transition name="dialog">
-				<v-button v-if="!isLoading" secondary x-small :disabled="isLoading" class="btn-skip" @click="skipOnboarding">
-					{{ t('onboarding.skip') }}
-				</v-button>
-			</Transition>
 		</div>
 	</public-view>
 </template>
@@ -283,10 +304,6 @@ async function nextSlide() {
 	display: flex;
 	flex-direction: row;
 	gap: 16px;
-}
-
-.btn-skip {
-	place-self: flex-end;
 }
 
 .onboarding-slides {
